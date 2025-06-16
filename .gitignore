@@ -1,14 +1,24 @@
-*.swp
+# Cargo
 target/
-**/*.rs.bk
+Cargo.lock
+!/Cargo.lock
+
+# State file
+.rustlings-state.txt
+
+# OS
 .DS_Store
-*.pdb
-exercises/clippy/Cargo.toml
-exercises/clippy/Cargo.lock
+.direnv/
+
+# Editor
+*.swp
 .idea
-.vscode
 
 .direnv/*
 !.direnv/.git-keep
 result
 result-bin
+*.iml
+
+# Ignore file for editors like Helix
+.ignore

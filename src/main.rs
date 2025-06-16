@@ -1,344 +1,213 @@
-use crate::exercise::{Exercise, ExerciseList};
-use crate::run::run;
-use crate::verify::verify;
-use clap::{crate_version, App, Arg, SubCommand};
-use console::Emoji;
-use notify::DebouncedEvent;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::ffi::OsStr;
-use std::fs;
-use std::io::{self, prelude::*};
-use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use anyhow::{Context, Result, bail};
+use app_state::StateFileStatus;
+use clap::{Parser, Subcommand};
+use std::{
+    io::{self, IsTerminal, Write},
+    path::Path,
+    process::ExitCode,
+};
+use term::{clear_terminal, press_enter_prompt};
 
-#[macro_use]
-mod ui;
+use self::{app_state::AppState, dev::DevCommands, info_file::InfoFile};
 
+mod app_state;
+mod cargo_toml;
+mod cmd;
+mod dev;
+mod embedded;
 mod exercise;
+mod info_file;
+mod init;
+mod list;
 mod run;
-mod verify;
+mod term;
+mod watch;
 
-fn main() {
-    let matches = App::new("rustlings")
-        .version(crate_version!())
-        .author("Marisa, Carol Nichols")
-        .about("Rustlings is a collection of small exercises to get you used to writing and reading Rust code")
-        .arg(
-            Arg::with_name("nocapture")
-                .long("nocapture")
-                .help("Show outputs from the test exercises")
-        )
-        .subcommand(
-            SubCommand::with_name("verify")
-                .alias("v")
-                .about("Verifies all exercises according to the recommended order")
-        )
-        .subcommand(
-            SubCommand::with_name("watch")
-                .alias("w")
-                .about("Reruns `verify` when files were edited")
-        )
-        .subcommand(
-            SubCommand::with_name("run")
-                .alias("r")
-                .about("Runs/Tests a single exercise")
-                .arg(Arg::with_name("name").required(true).index(1)),
-        )
-        .subcommand(
-            SubCommand::with_name("hint")
-                .alias("h")
-                .about("Returns a hint for the current exercise")
-                .arg(Arg::with_name("name").required(true).index(1)),
-        )
-        .subcommand(
-            SubCommand::with_name("list")
-                .alias("l")
-                .about("Lists the exercises available in rustlings")
-                .arg(
-                    Arg::with_name("paths")
-                        .long("paths")
-                        .short("p")
-                        .conflicts_with("names")
-                        .help("Show only the paths of the exercises")
-                )
-                .arg(
-                    Arg::with_name("names")
-                        .long("names")
-                        .short("n")
-                        .conflicts_with("paths")
-                        .help("Show only the names of the exercises")
-                )
-                .arg(
-                    Arg::with_name("filter")
-                        .long("filter")
-                        .short("f")
-                        .takes_value(true)
-                        .empty_values(false)
-                        .help(
-                            "Provide a string to match the exercise names.\
-                            \nComma separated patterns are acceptable."
-                        )
-                )
-                .arg(
-                    Arg::with_name("unsolved")
-                        .long("unsolved")
-                        .short("u")
-                        .conflicts_with("solved")
-                        .help("Display only exercises not yet solved")
-                )
-                .arg(
-                    Arg::with_name("solved")
-                        .long("solved")
-                        .short("s")
-                        .conflicts_with("unsolved")
-                        .help("Display only exercises that have been solved")
-                )
-        )
-        .get_matches();
+const CURRENT_FORMAT_VERSION: u8 = 1;
 
-    if matches.subcommand_name().is_none() {
-        println!();
-        println!(r#"       welcome to...                      "#);
-        println!(r#"                 _   _ _                  "#);
-        println!(r#"  _ __ _   _ ___| |_| (_)_ __   __ _ ___  "#);
-        println!(r#" | '__| | | / __| __| | | '_ \ / _` / __| "#);
-        println!(r#" | |  | |_| \__ \ |_| | | | | | (_| \__ \ "#);
-        println!(r#" |_|   \__,_|___/\__|_|_|_| |_|\__, |___/ "#);
-        println!(r#"                               |___/      "#);
-        println!();
+/// Rustlings is a collection of small exercises to get you used to writing and reading Rust code
+#[derive(Parser)]
+#[command(version)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Subcommands>,
+    /// Manually run the current exercise using `r` in the watch mode.
+    /// Only use this if Rustlings fails to detect exercise file changes.
+    #[arg(long)]
+    manual_run: bool,
+}
+
+#[derive(Subcommand)]
+enum Subcommands {
+    /// Initialize the official Rustlings exercises
+    Init,
+    /// Run a single exercise. Runs the next pending exercise if the exercise name is not specified
+    Run {
+        /// The name of the exercise
+        name: Option<String>,
+    },
+    /// Check all the exercises, marking them as done or pending accordingly.
+    CheckAll,
+    /// Reset a single exercise
+    Reset {
+        /// The name of the exercise
+        name: String,
+    },
+    /// Show a hint. Shows the hint of the next pending exercise if the exercise name is not specified
+    Hint {
+        /// The name of the exercise
+        name: Option<String>,
+    },
+    /// Commands for developing (community) Rustlings exercises
+    #[command(subcommand)]
+    Dev(DevCommands),
+}
+
+fn main() -> Result<ExitCode> {
+    let args = Args::parse();
+
+    if cfg!(not(debug_assertions)) && Path::new("dev/rustlings-repo.txt").exists() {
+        bail!("{OLD_METHOD_ERR}");
     }
 
-    if !Path::new("info.toml").exists() {
-        println!(
-            "{} must be run from the rustlings directory",
-            std::env::current_exe().unwrap().to_str().unwrap()
-        );
-        println!("Try `cd rustlings/`!");
-        std::process::exit(1);
-    }
-
-    if !rustc_exists() {
-        println!("We cannot find `rustc`.");
-        println!("Try running `rustc --version` to diagnose your problem.");
-        println!("For instructions on how to install Rust, check the README.");
-        std::process::exit(1);
-    }
-
-    let toml_str = &fs::read_to_string("info.toml").unwrap();
-    let exercises = toml::from_str::<ExerciseList>(toml_str).unwrap().exercises;
-    let verbose = matches.is_present("nocapture");
-
-    // Handle the list command
-    if let Some(list_m) = matches.subcommand_matches("list") {
-        if ["paths", "names"].iter().all(|k| !list_m.is_present(k)) {
-            println!("{:<17}\t{:<46}\t{:<7}", "Name", "Path", "Status");
+    'priority_cmd: {
+        match args.command {
+            Some(Subcommands::Init) => init::init().context("Initialization failed")?,
+            Some(Subcommands::Dev(dev_command)) => dev_command.run()?,
+            _ => break 'priority_cmd,
         }
-        let filters = list_m.value_of("filter").unwrap_or_default().to_lowercase();
-        exercises.iter().for_each(|e| {
-            let fname = format!("{}", e.path.display());
-            let filter_cond = filters
-                .split(',')
-                .filter(|f| !f.trim().is_empty())
-                .any(|f| e.name.contains(&f) || fname.contains(&f));
-            let status = if e.looks_done() { "Done" } else { "Pending" };
-            let solve_cond = {
-                (e.looks_done() && list_m.is_present("solved"))
-                    || (!e.looks_done() && list_m.is_present("unsolved"))
-                    || (!list_m.is_present("solved") && !list_m.is_present("unsolved"))
+
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if !Path::new("exercises").is_dir() {
+        println!("{PRE_INIT_MSG}");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    let info_file = InfoFile::parse()?;
+
+    if info_file.format_version > CURRENT_FORMAT_VERSION {
+        bail!(FORMAT_VERSION_HIGHER_ERR);
+    }
+
+    let (mut app_state, state_file_status) = AppState::new(
+        info_file.exercises,
+        info_file.final_message.unwrap_or_default(),
+    )?;
+
+    // Show the welcome message if the state file doesn't exist yet.
+    if let Some(welcome_message) = info_file.welcome_message {
+        match state_file_status {
+            StateFileStatus::NotRead => {
+                let mut stdout = io::stdout().lock();
+                clear_terminal(&mut stdout)?;
+
+                let welcome_message = welcome_message.trim_ascii();
+                write!(stdout, "{welcome_message}\n\nPress ENTER to continue ")?;
+                press_enter_prompt(&mut stdout)?;
+                clear_terminal(&mut stdout)?;
+                // Flush to be able to show errors occurring before printing a newline to stdout.
+                stdout.flush()?;
+            }
+            StateFileStatus::Read => (),
+        }
+    }
+
+    match args.command {
+        None => {
+            if !io::stdout().is_terminal() {
+                bail!("Unsupported or missing terminal/TTY");
+            }
+
+            let notify_exercise_names = if args.manual_run {
+                None
+            } else {
+                // For the notify event handler thread.
+                // Leaking is not a problem because the slice lives until the end of the program.
+                Some(
+                    &*app_state
+                        .exercises()
+                        .iter()
+                        .map(|exercise| exercise.name.as_bytes())
+                        .collect::<Vec<_>>()
+                        .leak(),
+                )
             };
-            if solve_cond && (filter_cond || !list_m.is_present("filter")) {
-                let line = if list_m.is_present("paths") {
-                    format!("{}\n", fname)
-                } else if list_m.is_present("names") {
-                    format!("{}\n", e.name)
-                } else {
-                    format!("{:<17}\t{:<46}\t{:<7}\n", e.name, fname, status)
-                };
-                // Somehow using println! leads to the binary panicking
-                // when its output is piped.
-                // So, we're handling a Broken Pipe error and exiting with 0 anyway
-                let stdout = std::io::stdout();
-                {
-                    let mut handle = stdout.lock();
-                    handle.write_all(line.as_bytes()).unwrap_or_else(|e| {
-                        match e.kind() {
-                            std::io::ErrorKind::BrokenPipe => std::process::exit(0),
-                            _ => std::process::exit(1),
-                        };
-                    });
-                }
+
+            watch::watch(&mut app_state, notify_exercise_names)?;
+        }
+        Some(Subcommands::Run { name }) => {
+            if let Some(name) = name {
+                app_state.set_current_exercise_by_name(&name)?;
             }
-        });
-        std::process::exit(0);
-    }
-
-    // Handle the run command
-    if let Some(ref matches) = matches.subcommand_matches("run") {
-        let name = matches.value_of("name").unwrap();
-
-        let matching_exercise = |e: &&Exercise| name == e.name;
-
-        let exercise = exercises.iter().find(matching_exercise).unwrap_or_else(|| {
-            println!("No exercise found for your given name!");
-            std::process::exit(1)
-        });
-
-        run(&exercise, verbose).unwrap_or_else(|_| std::process::exit(1));
-    }
-
-    if let Some(ref matches) = matches.subcommand_matches("hint") {
-        let name = matches.value_of("name").unwrap();
-
-        let exercise = exercises
-            .iter()
-            .find(|e| name == e.name)
-            .unwrap_or_else(|| {
-                println!("No exercise found for your given name!");
-                std::process::exit(1)
-            });
-
-        println!("{}", exercise.hint);
-    }
-
-    // Handle the verify command
-    if matches.subcommand_matches("verify").is_some() {
-        verify(&exercises, verbose).unwrap_or_else(|_| std::process::exit(1));
-    }
-
-    // Handle the watch command
-    if matches.subcommand_matches("watch").is_some() {
-        if let Err(e) = watch(&exercises, verbose) {
-            println!(
-                "Error: Could not watch your progress. Error message was {:?}.",
-                e
-            );
-            println!("Most likely you've run out of disk space or your 'inotify limit' has been reached.");
-            std::process::exit(1);
+            return run::run(&mut app_state);
         }
-        println!(
-            "{emoji} All exercises completed! {emoji}",
-            emoji = Emoji("🎉", "★")
-        );
-        println!();
-        println!("+----------------------------------------------------+");
-        println!("|          You made it to the Fe-nish line!          |");
-        println!("+--------------------------  ------------------------+");
-        println!("                          \\/                         ");
-        println!("     ▒▒          ▒▒▒▒▒▒▒▒      ▒▒▒▒▒▒▒▒          ▒▒   ");
-        println!("   ▒▒▒▒  ▒▒    ▒▒        ▒▒  ▒▒        ▒▒    ▒▒  ▒▒▒▒ ");
-        println!("   ▒▒▒▒  ▒▒  ▒▒            ▒▒            ▒▒  ▒▒  ▒▒▒▒ ");
-        println!(" ░░▒▒▒▒░░▒▒  ▒▒            ▒▒            ▒▒  ▒▒░░▒▒▒▒ ");
-        println!("   ▓▓▓▓▓▓▓▓  ▓▓      ▓▓██  ▓▓  ▓▓██      ▓▓  ▓▓▓▓▓▓▓▓ ");
-        println!("     ▒▒▒▒    ▒▒      ████  ▒▒  ████      ▒▒░░  ▒▒▒▒   ");
-        println!("       ▒▒  ▒▒▒▒▒▒        ▒▒▒▒▒▒        ▒▒▒▒▒▒  ▒▒     ");
-        println!("         ▒▒▒▒▒▒▒▒▒▒▓▓▓▓▓▓▒▒▒▒▒▒▒▒▓▓▒▒▓▓▒▒▒▒▒▒▒▒       ");
-        println!("           ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒         ");
-        println!("             ▒▒▒▒▒▒▒▒▒▒██▒▒▒▒▒▒██▒▒▒▒▒▒▒▒▒▒           ");
-        println!("           ▒▒  ▒▒▒▒▒▒▒▒▒▒██████▒▒▒▒▒▒▒▒▒▒  ▒▒         ");
-        println!("         ▒▒    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒    ▒▒       ");
-        println!("       ▒▒    ▒▒    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒    ▒▒    ▒▒     ");
-        println!("       ▒▒  ▒▒    ▒▒                  ▒▒    ▒▒  ▒▒     ");
-        println!("           ▒▒  ▒▒                      ▒▒  ▒▒         ");
-        println!();
-        println!("We hope you enjoyed learning about the various aspects of Rust!");
-        println!("If you noticed any issues, please don't hesitate to report them to our repo.");
-        println!("You can also contribute your own exercises to help the greater community!");
-        println!();
-        println!("Before reporting an issue or contributing, please read our guidelines:");
-        println!("https://github.com/rust-lang/rustlings/blob/main/CONTRIBUTING.md");
-    }
+        Some(Subcommands::CheckAll) => {
+            let mut stdout = io::stdout().lock();
+            if let Some(first_pending_exercise_ind) = app_state.check_all_exercises(&mut stdout)? {
+                if app_state.current_exercise().done {
+                    app_state.set_current_exercise_ind(first_pending_exercise_ind)?;
+                }
 
-    if matches.subcommand_name().is_none() {
-        let text = fs::read_to_string("default_out.txt").unwrap();
-        println!("{}", text);
-    }
-}
-
-fn spawn_watch_shell(failed_exercise_hint: &Arc<Mutex<Option<String>>>) {
-    let failed_exercise_hint = Arc::clone(failed_exercise_hint);
-    println!("Type 'hint' to get help or 'clear' to clear the screen");
-    thread::spawn(move || loop {
-        let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
-            Ok(_) => {
-                let input = input.trim();
-                if input.eq("hint") {
-                    if let Some(hint) = &*failed_exercise_hint.lock().unwrap() {
-                        println!("{}", hint);
-                    }
-                } else if input.eq("clear") {
-                    println!("\x1B[2J\x1B[1;1H");
+                stdout.write_all(b"\n\n")?;
+                let pending = app_state.n_pending();
+                if pending == 1 {
+                    stdout.write_all(b"One exercise pending: ")?;
                 } else {
-                    println!("unknown command: {}", input);
+                    write!(
+                        stdout,
+                        "{pending}/{} exercises pending. The first: ",
+                        app_state.exercises().len(),
+                    )?;
                 }
+                app_state
+                    .current_exercise()
+                    .terminal_file_link(&mut stdout)?;
+                stdout.write_all(b"\n")?;
+
+                return Ok(ExitCode::FAILURE);
+            } else {
+                app_state.render_final_message(&mut stdout)?;
             }
-            Err(error) => println!("error reading command: {}", error),
         }
-    });
-}
-
-fn watch(exercises: &[Exercise], verbose: bool) -> notify::Result<()> {
-    /* Clears the terminal with an ANSI escape code.
-    Works in UNIX and newer Windows terminals. */
-    fn clear_screen() {
-        println!("\x1Bc");
+        Some(Subcommands::Reset { name }) => {
+            app_state.set_current_exercise_by_name(&name)?;
+            let exercise_path = app_state.reset_current_exercise()?;
+            println!("The exercise {exercise_path} has been reset");
+        }
+        Some(Subcommands::Hint { name }) => {
+            if let Some(name) = name {
+                app_state.set_current_exercise_by_name(&name)?;
+            }
+            println!("{}", app_state.current_exercise().hint);
+        }
+        // Handled in an earlier match.
+        Some(Subcommands::Init | Subcommands::Dev(_)) => (),
     }
 
-    let (tx, rx) = channel();
-
-    let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_secs(2))?;
-    watcher.watch(Path::new("./exercises"), RecursiveMode::Recursive)?;
-
-    clear_screen();
-
-    let to_owned_hint = |t: &Exercise| t.hint.to_owned();
-    let failed_exercise_hint = match verify(exercises.iter(), verbose) {
-        Ok(_) => return Ok(()),
-        Err(exercise) => Arc::new(Mutex::new(Some(to_owned_hint(exercise)))),
-    };
-    spawn_watch_shell(&failed_exercise_hint);
-    loop {
-        match rx.recv() {
-            Ok(event) => match event {
-                DebouncedEvent::Create(b) | DebouncedEvent::Chmod(b) | DebouncedEvent::Write(b) => {
-                    if b.extension() == Some(OsStr::new("rs")) && b.exists() {
-                        let filepath = b.as_path().canonicalize().unwrap();
-                        let pending_exercises = exercises
-                            .iter()
-                            .skip_while(|e| !filepath.ends_with(&e.path))
-                            // .filter(|e| filepath.ends_with(&e.path))
-                            .chain(
-                                exercises
-                                    .iter()
-                                    .filter(|e| !e.looks_done() && !filepath.ends_with(&e.path))
-                            );
-                        clear_screen();
-                        match verify(pending_exercises, verbose) {
-                            Ok(_) => return Ok(()),
-                            Err(exercise) => {
-                                let mut failed_exercise_hint = failed_exercise_hint.lock().unwrap();
-                                *failed_exercise_hint = Some(to_owned_hint(exercise));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Err(e) => println!("watch error: {:?}", e),
-        }
-    }
+    Ok(ExitCode::SUCCESS)
 }
 
-fn rustc_exists() -> bool {
-    Command::new("rustc")
-        .args(&["--version"])
-        .stdout(Stdio::null())
-        .spawn()
-        .and_then(|mut child| child.wait())
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
+const OLD_METHOD_ERR: &str =
+    "You are trying to run Rustlings using the old method before version 6.
+The new method doesn't include cloning the Rustlings' repository.
+Please follow the instructions in `README.md`:
+https://github.com/rust-lang/rustlings#getting-started";
+
+const FORMAT_VERSION_HIGHER_ERR: &str =
+    "The format version specified in the `info.toml` file is higher than the last one supported.
+It is possible that you have an outdated version of Rustlings.
+Try to install the latest Rustlings version first.";
+
+const PRE_INIT_MSG: &str = r"
+       Welcome to...
+                 _   _ _
+  _ __ _   _ ___| |_| (_)_ __   __ _ ___
+ | '__| | | / __| __| | | '_ \ / _` / __|
+ | |  | |_| \__ \ |_| | | | | | (_| \__ \
+ |_|   \__,_|___/\__|_|_|_| |_|\__, |___/
+                               |___/
+
+The `exercises/` directory couldn't be found in the current directory.
+If you are just starting with Rustlings, run the command `rustlings init` to initialize it.";
